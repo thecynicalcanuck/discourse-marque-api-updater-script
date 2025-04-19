@@ -2,12 +2,14 @@
 """
 News Ticker updater for Discourse via Unraid User Scripts.
 
-• Fetches all H1 (“# …”) headlines (ignoring post #1) from configured topics.
-• Builds a list of the 7 most recent unique headlines (linking back to each post).
-• Emits each entry as an HTML <a> tag in marquee_list.
-• Joins them with '|' so Discourse splits them without quotes or commas.
-• Always pushes the updated list (no compare logic).
-• Always updates its “last_seen” checkpoints in state.
+• Skips post #1 in each topic (usually the image).  
+• Extracts the first Markdown H1 (“# Title”) from each new post.  
+• Builds a list of up to 7 most‐recent unique headlines, each as:
+    <a href="…">Title</a>
+• Joins them with '|' so Discourse sees each link as its own marquee_list entry
+  (no quotes or commas).  
+• Compares against your saved state and, if different, pushes the new list.  
+• Persists last_seen and marquee in state.
 """
 
 import os
@@ -18,7 +20,8 @@ import requests
 
 # ─── Paths & Imports ────────────────────────────────────────────────────────────
 PERSISTENT = "/boot/config/plugins/user.scripts/scripts/News Ticker"
-sys.path.insert(0, PERSISTENT)  # for vendored requests
+sys.path.insert(0, PERSISTENT)  # allow vendored requests if you pip‑installed there
+
 CFG_PATH   = os.path.join(PERSISTENT, "news_ticker_config.json")
 STATE_PATH = os.path.join(PERSISTENT, "news_ticker_state.json")
 
@@ -60,28 +63,43 @@ def update_ticker(items, cfg):
         "Api-Username": cfg["api_username"],
         "Content-Type": "application/json",
     }
-    # join items so Discourse sees each <a>…</a> as its own entry
     payload = {
         "name":  "marquee_list",
         "value": "|".join(items)
     }
-    r = requests.put(url, headers=hdr, json=payload, timeout=10)
-    r.raise_for_status()
+    resp = requests.put(url, headers=hdr, json=payload, timeout=10)
+    resp.raise_for_status()
     print(f"[+] Ticker updated with {len(items)} item(s)")
+
+# ─── Utility: Keep up to N unique, most recent ────────────────────────────────
+def uniq_limit(pairs, limit=7):
+    seen = set()
+    out  = []
+    # None timestamps are treated as empty string, so real ISO‐dates sort first
+    for _, itm in sorted(pairs, key=lambda x: x[0] or "", reverse=True):
+        if itm not in seen:
+            seen.add(itm)
+            out.append(itm)
+            if len(out) >= limit:
+                break
+    return out
 
 # ─── Main Logic ────────────────────────────────────────────────────────────────
 def main():
     cfg   = load_config()
     state = load_state()
 
-    auth = {"Api-Key": cfg["api_key"], "Api-Username": cfg["api_username"]}
+    headers = {
+        "Api-Key":      cfg["api_key"],
+        "Api-Username": cfg["api_username"]
+    }
     HEADING = re.compile(r"^#\s+(.+)$")
 
-    all_candidates = []
-    new_candidates = []
+    all_cands = []
+    new_cands = []
 
     for tid in cfg["topics"]:
-        posts = get_posts(tid, cfg["base_url"], auth)
+        posts = get_posts(tid, cfg["base_url"], headers)
         seen  = state["last_seen"].get(str(tid), 0)
 
         for p in posts:
@@ -97,36 +115,31 @@ def main():
                     break
             if not title:
                 continue
+
             url  = f"{cfg['base_url']}/t/{tid}/{pn}"
             item = f'<a href="{url}">{title}</a>'
-            when = p.get("created_at", "")
-            all_candidates.append((when, item))
+            ts   = p.get("created_at", "")
+            all_cands.append((ts, item))
             if pn > seen:
-                new_candidates.append((when, item))
+                new_cands.append((ts, item))
 
         if posts:
             state["last_seen"][str(tid)] = max(p.get("post_number", 0) for p in posts)
 
-    def uniq_limit(pairs, limit=7):
-        seen_items = set()
-        result     = []
-        for _, itm in sorted(pairs, key=lambda x: x[0], reverse=True):
-            if itm not in seen_items:
-                seen_items.add(itm)
-                result.append(itm)
-                if len(result) == limit:
-                    break
-        return result
-
-    if new_candidates:
-        combined = new_candidates + [(None, i) for i in state["marquee"]]
+    # Merge new headlines ahead of the old marquee, else fallback to all_cands
+    if new_cands:
+        combined = new_cands + [(None, i) for i in state["marquee"]]
         desired  = uniq_limit(combined, 7)
     else:
-        desired  = uniq_limit(all_candidates, 7)
+        desired  = uniq_limit(all_cands, 7)
 
-    # Always push the updated list
-    update_ticker(desired, cfg)
-    state["marquee"] = desired
+    # Push if changed
+    if desired != state["marquee"]:
+        update_ticker(desired, cfg)
+        state["marquee"] = desired
+    else:
+        print("[*] Marquee already up-to-date.")
+
     save_state(state)
 
 if __name__ == "__main__":
